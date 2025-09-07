@@ -325,6 +325,9 @@ void FeatureManager::triangulate(Vector3d Ps[], Vector3d tic[], Matrix3d ric[], 
     // First try to calculate stereo depth for available stereo cameras
     calculateStereoDepth(Ps, tic, ric);
     
+    // Propagate stereo scale to monocular features
+    propagateStereoScaleToMono(Ps, tic, ric);
+    
     for (int c = 0; c < NUM_OF_CAM; c++)
     {
 #if SINGLE_CAM_DEBUG
@@ -758,7 +761,7 @@ void FeatureManager::calculateStereoDepth(Vector3d Ps[], Vector3d tic[], Matrix3
     for (int c = 0; c < NUM_OF_CAM; c++)
     {
         // Check if this camera is stereo type
-        if (!frontend_ || !frontend_->sensors[c] || frontend_->sensors[c]->sensor_type_ != MCVO::STEREO)
+        if (!frontend_ || !frontend_->sensors[c] || frontend_->sensors[c]->type != MCVO::STEREO)
             continue;
 
         MCVO::MCVOstereo* stereo_sensor = dynamic_cast<MCVO::MCVOstereo*>(frontend_->sensors[c]);
@@ -891,4 +894,114 @@ bool FeatureManager::stereoFeatureMatch(const std::vector<cv::KeyPoint> &left_kp
         LOG(ERROR) << "Stereo feature matching failed: " << e.what();
         return false;
     }
+}
+
+// Propagate stereo scale to monocular features through co-visible landmarks
+void FeatureManager::propagateStereoScaleToMono(Vector3d Ps[], Vector3d tic[], Matrix3d ric[])
+{
+    // Collect stereo landmarks with known scale
+    std::vector<std::pair<int, MCVO::FeatureID>> stereo_landmarks;
+    
+    for (int c = 0; c < NUM_OF_CAM; c++)
+    {
+        for (auto &landmark : KeyPointLandmarks[c])
+        {
+            if (landmark.second.is_stereo && landmark.second.stereo_depth > 0)
+            {
+                stereo_landmarks.emplace_back(c, landmark.first);
+            }
+        }
+    }
+    
+    if (stereo_landmarks.empty())
+        return; // No stereo landmarks to propagate from
+    
+    // Find mono landmarks that share observations with stereo landmarks
+    for (int c = 0; c < NUM_OF_CAM; c++)
+    {
+        for (auto &mono_landmark : KeyPointLandmarks[c])
+        {
+            // Skip if already has depth or is stereo
+            if (mono_landmark.second.estimated_depth > 0 || mono_landmark.second.is_stereo)
+                continue;
+                
+            // Find co-visible stereo landmarks in same or nearby frames
+            double accumulated_scale = 0.0;
+            int scale_count = 0;
+            
+            for (const auto &stereo_pair : stereo_landmarks)
+            {
+                int stereo_cam = stereo_pair.first;
+                MCVO::FeatureID stereo_id = stereo_pair.second;
+                auto &stereo_landmark = KeyPointLandmarks[stereo_cam][stereo_id];
+                
+                // Check for overlapping frame observations
+                for (const auto &mono_obs : mono_landmark.second.obs)
+                {
+                    for (const auto &stereo_obs : stereo_landmark.obs)
+                    {
+                        // If observed in same frame or nearby frames
+                        double time_diff = std::abs(mono_obs.first - stereo_obs.first);
+                        if (time_diff < 0.1) // Within 100ms
+                        {
+                            // Calculate relative scale between landmarks
+                            Vector3d mono_ray = mono_obs.second.point.normalized();
+                            Vector3d stereo_ray = stereo_obs.second.point.normalized();
+                            
+                            // Simple scale propagation using depth ratio
+                            // This is a simplified approach - more sophisticated methods could be used
+                            double estimated_mono_depth = stereo_landmark.stereo_depth * 
+                                                         (mono_ray.norm() / stereo_ray.norm());
+                            
+                            if (estimated_mono_depth > MIN_DEPTH_MEASURED && 
+                                estimated_mono_depth < MAX_DEPTH_MEASURED)
+                            {
+                                accumulated_scale += estimated_mono_depth;
+                                scale_count++;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Apply averaged scale if we found co-visible stereo landmarks
+            if (scale_count > 0)
+            {
+                mono_landmark.second.estimated_depth = accumulated_scale / scale_count;
+                mono_landmark.second.estimate_flag = KeyPointLandmark::EstimateFlag::DIRECT_MEASURED;
+                LOG(INFO) << "Propagated stereo scale to mono landmark: " 
+                         << mono_landmark.second.feature_id 
+                         << " depth: " << mono_landmark.second.estimated_depth;
+            }
+        }
+    }
+}
+
+// Check if any camera in the system is stereo
+bool FeatureManager::hasStereoCamera()
+{
+    if (!frontend_)
+        return false;
+        
+    for (int c = 0; c < NUM_OF_CAM; c++)
+    {
+        if (frontend_->sensors[c] && frontend_->sensors[c]->type == MCVO::STEREO)
+            return true;
+    }
+    return false;
+}
+
+// Count how many landmarks have stereo depth information
+int FeatureManager::countStereoLandmarks()
+{
+    int count = 0;
+    for (int c = 0; c < NUM_OF_CAM; c++)
+    {
+        for (const auto &landmark : KeyPointLandmarks[c])
+        {
+            if (landmark.second.is_stereo && landmark.second.stereo_depth > 0)
+                count++;
+        }
+    }
+    return count;
 }

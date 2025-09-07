@@ -153,6 +153,9 @@ public:
                            const cv::Mat &left_descriptors, const cv::Mat &right_descriptors,
                            std::vector<cv::DMatch> &matches);
     double computeDisparityDepth(double disparity, double focal_length, double baseline);
+    void propagateStereoScaleToMono(Vector3d Ps[], Vector3d tic[], Matrix3d ric[]);
+    bool hasStereoCamera();
+    int countStereoLandmarks();
 
     // TODO 新加的函数,backend optimization interface
     //-------------------------

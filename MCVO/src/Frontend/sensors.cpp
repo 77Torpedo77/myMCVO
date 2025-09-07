@@ -2,6 +2,18 @@
 
 namespace MCVO
 {
+    // MCVOsensor base class implementation
+    MCVOsensor::MCVOsensor(sensor_type stype,
+                           string topic,
+                           string name,
+                           ros::NodeHandle *node,
+                           Eigen::Matrix3d R,
+                           Eigen::Vector3d T)
+        : type(stype), topic(topic), name(name), frontend_node(node), ext_R(R), ext_T(T)
+    {
+        
+    }
+
     // MCVOstereo implementation
     MCVOstereo::MCVOstereo(sensor_type type,
                            string left_img,
