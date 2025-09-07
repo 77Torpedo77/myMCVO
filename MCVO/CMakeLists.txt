@@ -118,6 +118,7 @@ add_executable(mcvo_estimator
   src/Estimator/factor/projection_mc_factor.cpp
   src/Estimator/factor/marginalization_factor.cpp
   src/Estimator/factor/SE3AbsolutatePoseFactor.cpp
+  src/Estimator/factor/stereo_disparity_factor.cpp
 
   src/utility/utility.cpp
   src/utility/visualization.cpp

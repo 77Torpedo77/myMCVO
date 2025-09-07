@@ -427,6 +427,13 @@ bool MCVOEstimator::initialMultiStructure()
             tmp_feature.state = false;                   
             tmp_feature.id = landmark.second.feature_id; 
 
+            // If stereo depth is available, use it for initialization
+            if (landmark.second.is_stereo && landmark.second.stereo_depth > 0)
+            {
+                tmp_feature.state = true;
+                tmp_feature.position = landmark.second.stereo_depth * landmark.second.obs.begin()->second.point.normalized();
+            }
+
             for (const auto &obser_per_frame : landmark.second.obs)
             {
 
@@ -2527,6 +2534,55 @@ void MCVOEstimator::optimization()
     }
 
     ROS_DEBUG("visual measurement count: %d", f_m_cnt);
+    
+    // Add stereo disparity constraints
+    int stereo_cnt = 0;
+    for (int c = 0; c < NUM_OF_CAM; c++)
+    {
+#if SINGLE_CAM_DEBUG
+        if (c != base_camera)
+            continue;
+#endif
+        for (auto &landmark : f_manager.KeyPointLandmarks[c])
+        {
+            // Only add stereo constraints for features with stereo depth
+            if (!landmark.second.is_stereo || landmark.second.stereo_depth <= 0)
+                continue;
+                
+            landmark.second.used_num = landmark.second.obs.size();
+            if (!(landmark.second.used_num >= 2 && time_frameid2_int_frameid.at(landmark.second.kf_id) < WINDOW_SIZE - 2))
+                continue;
+
+            auto host_tid = landmark.second.kf_id;
+            int host_id = time_frameid2_int_frameid.at(host_tid);
+
+            Vector3d pts_i = landmark.second.obs.at(host_tid).point;
+
+            // Add stereo disparity constraint factor
+            StereoDisparityFactor *stereo_f = new StereoDisparityFactor(pts_i, landmark.second.stereo_depth, 1.0);
+            
+            // Find a second observation for constraint
+            for (const auto &it_per_frame : landmark.second.obs)
+            {
+                auto target_tid = it_per_frame.first;
+                if (target_tid == host_tid)
+                    continue;
+                    
+                auto target_id = time_frameid2_int_frameid.at(target_tid);
+                
+                problem.AddResidualBlock(stereo_f,
+                                       loss_function,
+                                       para_Pose[host_id],
+                                       para_Pose[target_id],
+                                       para_Ex_Pose[c],
+                                       landmark.second.data.data());
+                stereo_cnt++;
+                break; // Use first valid observation pair
+            }
+        }
+    }
+    
+    ROS_DEBUG("stereo constraint count: %d", stereo_cnt);
     ROS_DEBUG("prepare for ceres: %f", t_prepare.toc());
   	
     if (relocalization_info)

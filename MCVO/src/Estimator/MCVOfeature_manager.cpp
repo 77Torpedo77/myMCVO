@@ -1,6 +1,8 @@
 #include "MCVOfeature_manager.h"
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <opencv2/opencv.hpp>
+#include <opencv2/features2d.hpp>
 
 FeatureManager::FeatureManager()
 {
@@ -320,6 +322,12 @@ void FeatureManager::removeFailures()
 // https://blog.csdn.net/kokerf/article/details/72844455
 void FeatureManager::triangulate(Vector3d Ps[], Vector3d tic[], Matrix3d ric[], int base_cam)
 {    
+    // First try to calculate stereo depth for available stereo cameras
+    calculateStereoDepth(Ps, tic, ric);
+    
+    // Propagate stereo scale to monocular features
+    propagateStereoScaleToMono(Ps, tic, ric);
+    
     for (int c = 0; c < NUM_OF_CAM; c++)
     {
 #if SINGLE_CAM_DEBUG
@@ -334,6 +342,14 @@ void FeatureManager::triangulate(Vector3d Ps[], Vector3d tic[], Matrix3d ric[], 
 
             if (landmark.second.estimated_depth > 0)
                 continue;
+
+            // If stereo depth is available, use it
+            if (landmark.second.is_stereo && landmark.second.stereo_depth > 0)
+            {
+                landmark.second.estimated_depth = landmark.second.stereo_depth;
+                landmark.second.estimate_flag = KeyPointLandmark::EstimateFlag::STEREO_DISPARITY;
+                continue;
+            }
 
             auto host_tid = landmark.second.kf_id;
             auto host_id = time_frameid2_int_frameid_->at(host_tid);
@@ -738,3 +754,254 @@ void FeatureManager::initFramePoseByPnP(int frameCnt, Vector3d Ps[], Matrix3d Rs
     }
 }
 #endif
+
+// Stereo depth calculation based on disparity
+void FeatureManager::calculateStereoDepth(Vector3d Ps[], Vector3d tic[], Matrix3d ric[])
+{
+    for (int c = 0; c < NUM_OF_CAM; c++)
+    {
+        // Check if this camera is stereo type
+        if (!frontend_ || !frontend_->sensors[c] || frontend_->sensors[c]->type != MCVO::STEREO)
+            continue;
+
+        MCVO::MCVOstereo* stereo_sensor = dynamic_cast<MCVO::MCVOstereo*>(frontend_->sensors[c]);
+        if (!stereo_sensor)
+            continue;
+
+        // Extract stereo parameters
+        double baseline = (stereo_sensor->lT - stereo_sensor->rT).norm();
+        double left_fx = stereo_sensor->lfx;
+        double right_fx = stereo_sensor->rfx;
+        double focal_length = (left_fx + right_fx) / 2.0; // Use average focal length
+
+        for (auto &landmark : KeyPointLandmarks[c])
+        {
+            // Skip if already has depth or is not suitable for stereo
+            if (landmark.second.estimated_depth > 0)
+                continue;
+
+            // For each observation, check if stereo depth can be computed
+            for (auto &obs_pair : landmark.second.obs)
+            {
+                auto &observation = obs_pair.second;
+                
+                // Check if this observation has corresponding stereo match
+                // For now, assume disparity is stored in depth_measured if positive
+                if (observation.depth_measured > 0)
+                {
+                    // Calculate depth from disparity
+                    double disparity = observation.depth_measured;
+                    double depth = computeDisparityDepth(disparity, focal_length, baseline);
+                    
+                    if (depth > MIN_DEPTH_MEASURED && depth < MAX_DEPTH_MEASURED)
+                    {
+                        landmark.second.stereo_depth = depth;
+                        landmark.second.estimated_depth = depth;
+                        landmark.second.is_stereo = true;
+                        landmark.second.estimate_flag = KeyPointLandmark::EstimateFlag::STEREO_DISPARITY;
+                        break; // Use first valid stereo depth
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Compute depth from disparity using stereo camera parameters
+double FeatureManager::computeDisparityDepth(double disparity, double focal_length, double baseline)
+{
+    if (disparity <= 0)
+        return -1.0;
+    
+    return (focal_length * baseline) / disparity;
+}
+
+// Extract features from stereo image pair
+bool FeatureManager::stereoFeatureExtract(const cv::Mat &left_img, const cv::Mat &right_img, 
+                                         std::vector<cv::KeyPoint> &left_kpts, std::vector<cv::KeyPoint> &right_kpts,
+                                         cv::Mat &left_descriptors, cv::Mat &right_descriptors)
+{
+    // Use ORB detector for feature extraction
+    cv::Ptr<cv::ORB> detector = cv::ORB::create(500, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 20);
+    
+    try
+    {
+        // Extract features from left image
+        detector->detectAndCompute(left_img, cv::noArray(), left_kpts, left_descriptors);
+        
+        // Extract features from right image  
+        detector->detectAndCompute(right_img, cv::noArray(), right_kpts, right_descriptors);
+        
+        return (left_kpts.size() > 0 && right_kpts.size() > 0);
+    }
+    catch (const cv::Exception &e)
+    {
+        LOG(ERROR) << "Stereo feature extraction failed: " << e.what();
+        return false;
+    }
+}
+
+// Match features between stereo image pair
+bool FeatureManager::stereoFeatureMatch(const std::vector<cv::KeyPoint> &left_kpts, const std::vector<cv::KeyPoint> &right_kpts,
+                                       const cv::Mat &left_descriptors, const cv::Mat &right_descriptors,
+                                       std::vector<cv::DMatch> &matches)
+{
+    if (left_descriptors.empty() || right_descriptors.empty())
+        return false;
+
+    try
+    {
+        // Use FLANN matcher for robust matching
+        cv::Ptr<cv::DescriptorMatcher> matcher = cv::DescriptorMatcher::create(cv::DescriptorMatcher::FLANNBASED);
+        
+        std::vector<std::vector<cv::DMatch>> knn_matches;
+        matcher->knnMatch(left_descriptors, right_descriptors, knn_matches, 2);
+        
+        // Apply Lowe's ratio test and epipolar constraint
+        const float ratio_thresh = 0.7f;
+        const float max_disparity_ratio = 0.1f; // Max disparity relative to image width
+        
+        matches.clear();
+        for (size_t i = 0; i < knn_matches.size(); i++)
+        {
+            if (knn_matches[i].size() >= 2)
+            {
+                // Lowe's ratio test
+                if (knn_matches[i][0].distance < ratio_thresh * knn_matches[i][1].distance)
+                {
+                    const cv::KeyPoint &left_kpt = left_kpts[knn_matches[i][0].queryIdx];
+                    const cv::KeyPoint &right_kpt = right_kpts[knn_matches[i][0].trainIdx];
+                    
+                    // Epipolar constraint for stereo (roughly same y-coordinate)
+                    float y_diff = std::abs(left_kpt.pt.y - right_kpt.pt.y);
+                    if (y_diff < 2.0f) // Allow small y difference
+                    {
+                        // Check disparity is reasonable (left point should be to the right of right point)
+                        float disparity = left_kpt.pt.x - right_kpt.pt.x;
+                        if (disparity > 0 && disparity < max_disparity_ratio * left_descriptors.rows)
+                        {
+                            matches.push_back(knn_matches[i][0]);
+                        }
+                    }
+                }
+            }
+        }
+        
+        return matches.size() > 0;
+    }
+    catch (const cv::Exception &e)
+    {
+        LOG(ERROR) << "Stereo feature matching failed: " << e.what();
+        return false;
+    }
+}
+
+// Propagate stereo scale to monocular features through co-visible landmarks
+void FeatureManager::propagateStereoScaleToMono(Vector3d Ps[], Vector3d tic[], Matrix3d ric[])
+{
+    // Collect stereo landmarks with known scale
+    std::vector<std::pair<int, MCVO::FeatureID>> stereo_landmarks;
+    
+    for (int c = 0; c < NUM_OF_CAM; c++)
+    {
+        for (auto &landmark : KeyPointLandmarks[c])
+        {
+            if (landmark.second.is_stereo && landmark.second.stereo_depth > 0)
+            {
+                stereo_landmarks.emplace_back(c, landmark.first);
+            }
+        }
+    }
+    
+    if (stereo_landmarks.empty())
+        return; // No stereo landmarks to propagate from
+    
+    // Find mono landmarks that share observations with stereo landmarks
+    for (int c = 0; c < NUM_OF_CAM; c++)
+    {
+        for (auto &mono_landmark : KeyPointLandmarks[c])
+        {
+            // Skip if already has depth or is stereo
+            if (mono_landmark.second.estimated_depth > 0 || mono_landmark.second.is_stereo)
+                continue;
+                
+            // Find co-visible stereo landmarks in same or nearby frames
+            double accumulated_scale = 0.0;
+            int scale_count = 0;
+            
+            for (const auto &stereo_pair : stereo_landmarks)
+            {
+                int stereo_cam = stereo_pair.first;
+                MCVO::FeatureID stereo_id = stereo_pair.second;
+                auto &stereo_landmark = KeyPointLandmarks[stereo_cam][stereo_id];
+                
+                // Check for overlapping frame observations
+                for (const auto &mono_obs : mono_landmark.second.obs)
+                {
+                    for (const auto &stereo_obs : stereo_landmark.obs)
+                    {
+                        // If observed in same frame or nearby frames
+                        double time_diff = std::abs(mono_obs.first - stereo_obs.first);
+                        if (time_diff < 0.1) // Within 100ms
+                        {
+                            // Calculate relative scale between landmarks
+                            Vector3d mono_ray = mono_obs.second.point.normalized();
+                            Vector3d stereo_ray = stereo_obs.second.point.normalized();
+                            
+                            // Simple scale propagation using depth ratio
+                            // This is a simplified approach - more sophisticated methods could be used
+                            double estimated_mono_depth = stereo_landmark.stereo_depth * 
+                                                         (mono_ray.norm() / stereo_ray.norm());
+                            
+                            if (estimated_mono_depth > MIN_DEPTH_MEASURED && 
+                                estimated_mono_depth < MAX_DEPTH_MEASURED)
+                            {
+                                accumulated_scale += estimated_mono_depth;
+                                scale_count++;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Apply averaged scale if we found co-visible stereo landmarks
+            if (scale_count > 0)
+            {
+                mono_landmark.second.estimated_depth = accumulated_scale / scale_count;
+                mono_landmark.second.estimate_flag = KeyPointLandmark::EstimateFlag::DIRECT_MEASURED;
+                LOG(INFO) << "Propagated stereo scale to mono landmark: " 
+                         << mono_landmark.second.feature_id 
+                         << " depth: " << mono_landmark.second.estimated_depth;
+            }
+        }
+    }
+}
+
+// Check if any camera in the system is stereo
+bool FeatureManager::hasStereoCamera()
+{
+    if (!frontend_)
+        return false;
+        
+    for (int c = 0; c < NUM_OF_CAM; c++)
+    {
+        if (frontend_->sensors[c] && frontend_->sensors[c]->type == MCVO::STEREO)
+            return true;
+    }
+    return false;
+}
+
+// Count how many landmarks have stereo depth information
+int FeatureManager::countStereoLandmarks()
+{
+    int count = 0;
+    for (int c = 0; c < NUM_OF_CAM; c++)
+    {
+        for (const auto &landmark : KeyPointLandmarks[c])
+        {
+            if (landmark.second.is_stereo && landmark.second.stereo_depth > 0)
+                count++;
+        }
+    }
+    return count;
+}
