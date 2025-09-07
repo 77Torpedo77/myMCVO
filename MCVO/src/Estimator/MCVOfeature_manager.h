@@ -59,7 +59,8 @@ public:
     {
         NOT_INITIAL,
         DIRECT_MEASURED,
-        TRIANGULATE
+        TRIANGULATE,
+        STEREO_DISPARITY
     };
 
     enum class SolveFlag
@@ -80,6 +81,8 @@ public:
           used_num(0),
           estimated_depth(-1.0),
           measured_depth(_measured_depth),
+          is_stereo(false),
+          stereo_depth(-1.0),
           estimate_flag(EstimateFlag::NOT_INITIAL),
           solve_flag(SolveFlag::NOT_SOLVE)
     {
@@ -94,6 +97,8 @@ public:
     bool is_margin;
     double estimated_depth;
     double measured_depth; // TODO:这个好像没什么用
+    bool is_stereo;        // flag to distinguish stereo vs monocular features
+    double stereo_depth;   // depth calculated from stereo disparity
 
     EstimateFlag estimate_flag; // 0 initial; 1 by depth image; 2 by triangulate
     //    EstimateFlag estimate_flag;
@@ -138,6 +143,16 @@ public:
 
     void
     triangulateWithDepth(Vector3d Ps[], Vector3d tic[], Matrix3d ric[],int base_cam);
+
+    // Stereo functionality 
+    void calculateStereoDepth(Vector3d Ps[], Vector3d tic[], Matrix3d ric[]);
+    bool stereoFeatureExtract(const cv::Mat &left_img, const cv::Mat &right_img, 
+                             std::vector<cv::KeyPoint> &left_kpts, std::vector<cv::KeyPoint> &right_kpts,
+                             cv::Mat &left_descriptors, cv::Mat &right_descriptors);
+    bool stereoFeatureMatch(const std::vector<cv::KeyPoint> &left_kpts, const std::vector<cv::KeyPoint> &right_kpts,
+                           const cv::Mat &left_descriptors, const cv::Mat &right_descriptors,
+                           std::vector<cv::DMatch> &matches);
+    double computeDisparityDepth(double disparity, double focal_length, double baseline);
 
     // TODO 新加的函数,backend optimization interface
     //-------------------------

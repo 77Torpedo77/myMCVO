@@ -23,6 +23,7 @@
 #include "factor/projection_mc_factor.h"
 #include "factor/marginalization_factor.h"
 #include "factor/SE3AbsolutatePoseFactor.h"
+#include "factor/stereo_disparity_factor.h"
 // #include "factor/SE3RelativtePoseFactor.h"
 #include "../Frontend/MCVOfrontend_data.h"
 
